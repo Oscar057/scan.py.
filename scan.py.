@@ -1,0 +1,118 @@
+import os, re, datetime as dt
+import requests
+
+CMC_KEY = os.environ["CMC_API_KEY"]
+GH_TOKEN = os.environ["GITHUB_TOKEN"]
+REPO = os.environ["GITHUB_REPOSITORY"]
+OWNER = os.environ["GITHUB_REPOSITORY_OWNER"]
+MIN_PCT = float(os.environ.get("MIN_PCT", "30"))
+TEST = os.environ.get("TEST", "false") == "true"
+
+CMC_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest"
+GH_API = "https://api.github.com/repos/" + REPO + "/issues"
+GH_HEADERS = {
+    "Authorization": "Bearer " + GH_TOKEN,
+    "Accept": "application/vnd.github+json",
+}
+
+
+def chain_of(c):
+    if c["slug"] in ("ethereum", "solana", "bnb"):
+        return c["name"]
+    name = (c.get("platform") or {}).get("name") or ""
+    low = name.lower()
+    if any(k in low for k in ("solana", "ethereum", "bnb", "binance")):
+        return name
+    return None
+
+
+def fetch():
+    coins, start = [], 1
+    while True:
+        r = requests.get(
+            CMC_URL,
+            headers={"X-CMC_PRO_API_KEY": CMC_KEY},
+            timeout=60,
+            params={
+                "start": start,
+                "limit": 5000,
+                "convert": "USD",
+                "sort": "percent_change_24h",
+                "sort_dir": "desc",
+                "percent_change_24h_min": MIN_PCT,
+            },
+        )
+        if r.status_code != 200:
+            raise SystemExit("CMC error %s: %s" % (r.status_code, r.text[:300]))
+        data = r.json()["data"]
+        coins += data
+        if len(data) < 5000:
+            return coins
+        start += 5000
+
+
+def already_alerted_ids():
+    since = (dt.datetime.utcnow() - dt.timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = requests.get(
+        GH_API,
+        headers=GH_HEADERS,
+        timeout=30,
+        params={"labels": "cmc-alert", "state": "all", "since": since, "per_page": 100},
+    )
+    r.raise_for_status()
+    ids = set()
+    for issue in r.json():
+        m = re.search(r"cmc-id:(\d+)", issue.get("body") or "")
+        if m:
+            ids.add(int(m.group(1)))
+    return ids
+
+
+def create_issue(title, body):
+    r = requests.post(
+        GH_API,
+        headers=GH_HEADERS,
+        timeout=30,
+        json={"title": title, "body": body, "labels": ["cmc-alert"]},
+    )
+    r.raise_for_status()
+
+
+def main():
+    if TEST:
+        create_issue(
+            "Test alert: GitHub notifications work",
+            "@" + OWNER + " this is a test alert from your CMC scanner bot.",
+        )
+        print("Test issue created")
+        return
+
+    seen = already_alerted_ids()
+    count = 0
+    for c in fetch():
+        chain = chain_of(c)
+        if not chain or c["id"] in seen:
+            continue
+        q = c["quote"]["USD"]
+        pct = q["percent_change_24h"]
+        title = "%s (%s) +%.1f%% in 24h [%s]" % (c["name"], c["symbol"], pct, chain)
+        body = (
+            "@%s 🚀 **%s (%s)** is up **%.1f%%** in 24h\n\n"
+            "- Chain: %s\n"
+            "- Price: $%.8g\n"
+            "- Market cap: $%s\n"
+            "- 24h volume: $%s\n"
+            "- https://coinmarketcap.com/currencies/%s/\n\n"
+            "<!-- cmc-id:%d -->"
+        ) % (
+            OWNER, c["name"], c["symbol"], pct, chain, q["price"],
+            "{:,.0f}".format(q.get("market_cap") or 0),
+            "{:,.0f}".format(q.get("volume_24h") or 0),
+            c["slug"], c["id"],
+        )
+        create_issue(title, body)
+        count += 1
+    print("Alerts created:", count)
+
+
+main()
